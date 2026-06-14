@@ -1,44 +1,69 @@
 # mosdns-openwrt
 
-通过 GitHub Actions 自动将上游 [IrineSistiana/mosdns](https://github.com/IrineSistiana/mosdns) 编译为可在 OpenWrt 上安装的包。
+OpenWrt package recipe for [IrineSistiana/mosdns](https://github.com/IrineSistiana/mosdns) — a plugin-based DNS forwarder/server written in Go.
 
-- **目标 OpenWrt 版本**：`25.12.4`
-- **目标平台**：`x86_64`（target `x86/64`）
-- **mosdns 版本**：默认拉取最新 release，可在手动触发工作流时指定
+This repo contains only the OpenWrt packaging (Makefile, init script, UCI config, default `config.yaml`) plus a GitHub Actions pipeline that builds `.ipk` / `.apk` artifacts using the official OpenWrt SDK. No mosdns source lives here.
 
-## 使用方式
+## Downloads
 
-### 触发构建
+Pre-built packages for tagged releases are published to the [Releases page](https://github.com/Soberrrr/mosdns-openwrt/releases).
 
-1. **推送 tag**：在本仓库推送形如 `v5.3.4` 的 tag，将自动构建并发布 GitHub Release。
-   ```sh
-   git tag v5.3.4
-   git push origin v5.3.4
-   ```
+Each release lists the upstream mosdns version, OpenWrt release, and target architecture in its notes.
 
-2. **手动触发**：在 GitHub `Actions` 页面选择 *Build mosdns OpenWrt package* → *Run workflow*，可填入：
-   - `mosdns_version`：mosdns 的 tag（如 `v5.3.4`）。留空则自动拉取最新。
-   - `openwrt_version`：OpenWrt 版本，默认 `25.12.4`。
-   - `target`：OpenWrt target，默认 `x86/64`。
+## Build via GitHub Actions
 
-### 下载产物
+The `Build mosdns OpenWrt package` workflow can be triggered two ways:
 
-- **Tag 触发**：在仓库 Releases 页面下载附带的 `mosdns_*.ipk` / `mosdns-*.apk`。
-- **手动触发**：在对应 Workflow Run 页面的 *Artifacts* 区域下载。
+- **Tag push** — push a `vX.Y.Z` tag; the workflow builds and creates a GitHub Release with the artifacts.
+- **Manual dispatch** — run the workflow from the Actions tab with optional inputs:
+  - `mosdns_version` — e.g. `v5.3.4`. Empty = fetch latest upstream release.
+  - `openwrt_version` — default `latest` (resolves to the newest non-prerelease tag from `openwrt/openwrt` via the GitHub API). Pass an explicit version like `25.12.4` or `24.10.7` to pin.
+  - `target` — default `x86/64` (e.g. `ramips/mt7621`, `aarch64_cortex-a53`, etc.).
 
-### 在 OpenWrt 上安装
+Tag-driven release builds always use the pinned `OPENWRT_VERSION_DEFAULT` declared in `.github/workflows/build.yml` (currently `25.12.4`) so the same mosdns tag rebuilds reproducibly. Bump that env when you intentionally move the release line forward.
 
-OpenWrt 25.12 默认使用 APK，但部分镜像仍兼容 IPK。工作流会同时收集两种格式（取决于 SDK 实际产出）。
+The SDK tarball name (which encodes the toolchain GCC version) is resolved at build time from the target's `sha256sums` index, so new OpenWrt releases with newer toolchains work without workflow edits.
+
+Note: SDK 25.x produces `.apk`; older SDKs produce `.ipk`. The workflow detects and uploads whichever format is built.
+
+## Build locally
+
+Requires the OpenWrt SDK matching your target. Roughly:
 
 ```sh
-# APK 格式（推荐 25.12+）
-apk add --allow-untrusted ./mosdns-*.apk
+# 1. Download and extract the OpenWrt SDK for your target
+curl -fL -O https://downloads.openwrt.org/releases/25.12.4/targets/x86/64/openwrt-sdk-25.12.4-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+mkdir sdk && tar -I zstd -xf openwrt-sdk-*.tar.zst -C sdk --strip-components=1
 
-# IPK 格式（旧版兼容）
+# 2. Update feeds
+cd sdk
+./scripts/feeds update -a
+./scripts/feeds install -a
+
+# 3. Drop this package in
+cp -r ../package/mosdns package/mosdns
+
+# 4. Configure and build
+make defconfig
+echo 'CONFIG_PACKAGE_mosdns=m' >> .config
+make defconfig
+make package/mosdns/compile -j"$(nproc)" V=s
+
+# 5. Artifact
+find bin/packages -name 'mosdns*.ipk' -o -name 'mosdns*.apk'
+```
+
+## Install on the device
+
+```sh
+# apk-based OpenWrt (24.10+/25.x default)
+apk add ./mosdns_*.apk
+
+# opkg-based OpenWrt
 opkg install ./mosdns_*.ipk
 ```
 
-启用并启动服务：
+After install, the service is **disabled by default**. Enable and start:
 
 ```sh
 uci set mosdns.config.enabled=1
@@ -47,27 +72,38 @@ uci commit mosdns
 /etc/init.d/mosdns start
 ```
 
-默认配置位于 `/etc/mosdns/config.yaml`，可按需修改。完整配置语法见 [mosdns wiki](https://irine-sistiana.gitbook.io/mosdns-wiki/)。
+## What gets installed
 
-## 仓库结构
+| Path | Purpose |
+| --- | --- |
+| `/usr/bin/mosdns` | Binary |
+| `/etc/init.d/mosdns` | procd init script |
+| `/etc/config/mosdns` | UCI config (conffile, preserved on upgrade) |
+| `/etc/mosdns/config.yaml` | mosdns config (conffile, preserved on upgrade) |
+| `/var/lib/mosdns` | Working directory, created on service start |
+| `/var/log/mosdns.log` | Log path (when configured) |
 
-```
-.
-├── .github/workflows/build.yml   # GitHub Actions 工作流
-├── package/mosdns/
-│   ├── Makefile                  # OpenWrt 包定义
-│   └── files/
-│       ├── mosdns.init           # /etc/init.d/mosdns（procd 服务）
-│       ├── mosdns.config         # /etc/config/mosdns（UCI 默认值）
-│       └── config.yaml           # /etc/mosdns/config.yaml（mosdns 默认配置）
-└── README.md
-```
+## UCI options
 
-## 注意
+`/etc/config/mosdns`:
 
-- 本仓库仅打包 mosdns 主程序，不包含 LuCI Web 管理界面。如需 Web 配置界面，可参考 [sbwml/luci-app-mosdns](https://github.com/sbwml/luci-app-mosdns)。
-- 上游若发布大版本（如 v6+），可能需要更新 `package/mosdns/Makefile` 中的 `GO_PKG` 路径（当前：`github.com/IrineSistiana/mosdns/v5`）。
+| Option | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `0` | Set to `1` to allow the init script to start the service |
+| `config_file` | `/etc/mosdns/config.yaml` | Passed to `mosdns start --config` |
+| `log_file` | `/var/log/mosdns.log` | Parent dir is created on start |
+| `working_dir` | `/var/lib/mosdns` | Passed to `mosdns start --dir`; used by plugins for cache/data |
 
-## 许可
+## Default `config.yaml`
 
-mosdns 上游使用 GPL-3.0-or-later。本仓库的打包脚本同样采用 GPL-3.0-or-later。
+The shipped default forwards all queries over DoH to Cloudflare and Google, listening on UDP/TCP `:5335`. Replace it with your own configuration — see the upstream [mosdns documentation](https://irine-sistiana.gitbook.io/mosdns-wiki/) for plugin reference.
+
+To use mosdns as the system resolver, point dnsmasq at it (e.g. set `server=127.0.0.1#5335` and `no-resolv`).
+
+## Versioning
+
+`PKG_VERSION` in `package/mosdns/Makefile` pins the upstream mosdns tag (`v$(PKG_VERSION)`). CI overrides it with the resolved version at build time, so manual edits are only needed when developing locally. Bump `PKG_RELEASE` for packaging-only changes.
+
+## License
+
+Packaging files: GPL-3.0-or-later (matching upstream mosdns).

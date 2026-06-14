@@ -11,15 +11,18 @@ on:
         required: false
         default: ''
       openwrt_version:
-        description: 'OpenWrt release version'
+        description: "OpenWrt release version (e.g. 25.12.4), or 'latest' for newest stable"
         required: false
-        default: '25.12.4'
+        default: 'latest'
       target:
         description: 'OpenWrt target (e.g. x86/64)'
         required: false
         default: 'x86/64'
 
 env:
+  # Used for tag-driven release builds (kept pinned for reproducibility) and as
+  # a fallback if "latest" resolution fails. Bump when intentionally moving the
+  # release line forward.
   OPENWRT_VERSION_DEFAULT: '25.12.4'
   OPENWRT_TARGET_DEFAULT: 'x86/64'
 
@@ -40,8 +43,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          OPENWRT_VERSION="${{ github.event.inputs.openwrt_version }}"
-          [ -z "$OPENWRT_VERSION" ] && OPENWRT_VERSION="${OPENWRT_VERSION_DEFAULT}"
+          OPENWRT_VERSION_INPUT="${{ github.event.inputs.openwrt_version }}"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # tag-driven release: pin OpenWrt version for reproducible artifacts
+            OPENWRT_VERSION="${OPENWRT_VERSION_DEFAULT}"
+            echo "Tag-driven build: using pinned OpenWrt ${OPENWRT_VERSION}"
+          elif [ -z "$OPENWRT_VERSION_INPUT" ] || [ "$OPENWRT_VERSION_INPUT" = "latest" ]; then
+            echo "Resolving latest OpenWrt stable release from GitHub..."
+            OPENWRT_VERSION="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/openwrt/openwrt/releases?per_page=30" \
+              | jq -r '[.[] | select(.prerelease==false) | .tag_name] | map(select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))) | .[]' \
+              | sed 's/^v//' | sort -V | tail -1)"
+            if [ -z "$OPENWRT_VERSION" ]; then
+              echo "::warning::Failed to resolve latest OpenWrt release, falling back to ${OPENWRT_VERSION_DEFAULT}"
+              OPENWRT_VERSION="${OPENWRT_VERSION_DEFAULT}"
+            fi
+          else
+            OPENWRT_VERSION="$OPENWRT_VERSION_INPUT"
+          fi
 
           TARGET="${{ github.event.inputs.target }}"
           [ -z "$TARGET" ] && TARGET="${OPENWRT_TARGET_DEFAULT}"
@@ -65,8 +87,17 @@ jobs:
           TARGET_PATH="$(echo "$TARGET" | tr '/' '-')"
           ARCH_DIR_FROM_TARGET="$(echo "$TARGET" | tr '/' '_')"
 
-          SDK_NAME="openwrt-sdk-${OPENWRT_VERSION}-${TARGET_PATH}_gcc-14.3.0_musl.Linux-x86_64"
-          SDK_TARBALL="${SDK_NAME}.tar.zst"
+          # Resolve the actual SDK tarball name (toolchain/gcc version varies
+          # across OpenWrt releases) by parsing the target's sha256sums index.
+          SHA_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/sha256sums"
+          SDK_TARBALL="$(curl -fsSL "$SHA_URL" \
+            | grep -oE 'openwrt-sdk-[^[:space:]]+\.Linux-x86_64\.tar\.zst' \
+            | head -1 || true)"
+          if [ -z "$SDK_TARBALL" ]; then
+            echo "::error::Could not find SDK tarball name in $SHA_URL"
+            exit 1
+          fi
+          SDK_NAME="${SDK_TARBALL%.tar.zst}"
           SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/${SDK_TARBALL}"
 
           echo "openwrt_version=${OPENWRT_VERSION}" >> "$GITHUB_OUTPUT"
@@ -78,7 +109,7 @@ jobs:
           echo "sdk_tarball=${SDK_TARBALL}"         >> "$GITHUB_OUTPUT"
           echo "sdk_url=${SDK_URL}"                 >> "$GITHUB_OUTPUT"
 
-          echo "::notice::Building mosdns ${MOSDNS_VERSION} for OpenWrt ${OPENWRT_VERSION} ${TARGET}"
+          echo "::notice::Building mosdns ${MOSDNS_VERSION} for OpenWrt ${OPENWRT_VERSION} ${TARGET} (SDK: ${SDK_TARBALL})"
 
       - name: Install host dependencies
         run: |
