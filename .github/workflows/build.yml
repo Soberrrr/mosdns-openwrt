@@ -1,0 +1,186 @@
+name: Build mosdns OpenWrt package
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      mosdns_version:
+        description: 'mosdns version tag (e.g. v5.3.4). Leave empty to fetch latest.'
+        required: false
+        default: ''
+      openwrt_version:
+        description: 'OpenWrt release version'
+        required: false
+        default: '25.12.4'
+      target:
+        description: 'OpenWrt target (e.g. x86/64)'
+        required: false
+        default: 'x86/64'
+
+env:
+  OPENWRT_VERSION_DEFAULT: '25.12.4'
+  OPENWRT_TARGET_DEFAULT: 'x86/64'
+
+jobs:
+  build:
+    name: Build mosdns ipk/apk
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve build parameters
+        id: params
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          OPENWRT_VERSION="${{ github.event.inputs.openwrt_version }}"
+          [ -z "$OPENWRT_VERSION" ] && OPENWRT_VERSION="${OPENWRT_VERSION_DEFAULT}"
+
+          TARGET="${{ github.event.inputs.target }}"
+          [ -z "$TARGET" ] && TARGET="${OPENWRT_TARGET_DEFAULT}"
+
+          MOSDNS_VERSION="${{ github.event.inputs.mosdns_version }}"
+          if [ -z "$MOSDNS_VERSION" ]; then
+            echo "Fetching latest mosdns release tag from GitHub API..."
+            MOSDNS_VERSION="$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/IrineSistiana/mosdns/releases/latest \
+              | jq -r '.tag_name')"
+          fi
+          [ -z "$MOSDNS_VERSION" ] || [ "$MOSDNS_VERSION" = "null" ] && {
+            echo "Failed to determine mosdns version" >&2
+            exit 1
+          }
+
+          MOSDNS_VERSION_NO_V="${MOSDNS_VERSION#v}"
+
+          TARGET_PATH="$(echo "$TARGET" | tr '/' '-')"
+          ARCH_DIR_FROM_TARGET="$(echo "$TARGET" | tr '/' '_')"
+
+          SDK_NAME="openwrt-sdk-${OPENWRT_VERSION}-${TARGET_PATH}_gcc-14.3.0_musl.Linux-x86_64"
+          SDK_TARBALL="${SDK_NAME}.tar.zst"
+          SDK_URL="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${TARGET}/${SDK_TARBALL}"
+
+          echo "openwrt_version=${OPENWRT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "target=${TARGET}"                   >> "$GITHUB_OUTPUT"
+          echo "target_path=${TARGET_PATH}"         >> "$GITHUB_OUTPUT"
+          echo "mosdns_version=${MOSDNS_VERSION}"   >> "$GITHUB_OUTPUT"
+          echo "mosdns_version_no_v=${MOSDNS_VERSION_NO_V}" >> "$GITHUB_OUTPUT"
+          echo "sdk_name=${SDK_NAME}"               >> "$GITHUB_OUTPUT"
+          echo "sdk_tarball=${SDK_TARBALL}"         >> "$GITHUB_OUTPUT"
+          echo "sdk_url=${SDK_URL}"                 >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Building mosdns ${MOSDNS_VERSION} for OpenWrt ${OPENWRT_VERSION} ${TARGET}"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ccache file gawk gettext git \
+            libelf-dev libncurses-dev libssl-dev libzstd-dev \
+            python3 python3-distutils-extra python3-setuptools \
+            rsync subversion swig unzip wget xsltproc zlib1g-dev zstd jq
+
+      - name: Cache OpenWrt SDK tarball
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.params.outputs.sdk_tarball }}
+          key: openwrt-sdk-${{ steps.params.outputs.openwrt_version }}-${{ steps.params.outputs.target_path }}
+
+      - name: Download OpenWrt SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fL --retry 5 --retry-delay 3 \
+            -o "${{ steps.params.outputs.sdk_tarball }}" \
+            "${{ steps.params.outputs.sdk_url }}"
+
+      - name: Extract SDK
+        run: |
+          mkdir -p sdk
+          tar -I zstd -xf "${{ steps.params.outputs.sdk_tarball }}" -C sdk --strip-components=1
+          ls sdk
+
+      - name: Update & install feeds
+        working-directory: sdk
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Inject mosdns package
+        run: |
+          set -e
+          rm -rf sdk/package/mosdns
+          cp -r package/mosdns sdk/package/mosdns
+          # Override PKG_VERSION with resolved mosdns version
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${{ steps.params.outputs.mosdns_version_no_v }}/" sdk/package/mosdns/Makefile
+          echo "----- Makefile head -----"
+          head -n 25 sdk/package/mosdns/Makefile
+
+      - name: Configure SDK build
+        working-directory: sdk
+        run: |
+          make defconfig
+          echo "CONFIG_PACKAGE_mosdns=m" >> .config
+          make defconfig
+          grep -E '^CONFIG_PACKAGE_mosdns' .config || true
+
+      - name: Build mosdns package
+        working-directory: sdk
+        run: |
+          make package/mosdns/compile -j$(nproc) V=s
+
+      - name: Detect package format used by SDK
+        id: pkgfmt
+        working-directory: sdk
+        run: |
+          if find bin/packages -type f -name 'mosdns*.apk' | grep -q .; then
+            echo "format=apk" >> "$GITHUB_OUTPUT"
+          elif find bin/packages -type f -name 'mosdns*.ipk' | grep -q .; then
+            echo "format=ipk" >> "$GITHUB_OUTPUT"
+          else
+            echo "format=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect artifacts
+        run: |
+          set -e
+          mkdir -p artifacts
+          find sdk/bin/packages -type f \( -name 'mosdns*.ipk' -o -name 'mosdns*.apk' \) -print -exec cp {} artifacts/ \;
+          ls -la artifacts
+          [ -n "$(ls -A artifacts 2>/dev/null)" ] || {
+            echo "::error::No mosdns package was produced"
+            exit 1
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosdns-${{ steps.params.outputs.mosdns_version }}-openwrt-${{ steps.params.outputs.openwrt_version }}-${{ steps.params.outputs.target_path }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            **mosdns upstream version:** `${{ steps.params.outputs.mosdns_version }}`
+            **OpenWrt release:** `${{ steps.params.outputs.openwrt_version }}`
+            **Target:** `${{ steps.params.outputs.target }}`
+            **Package format:** `${{ steps.pkgfmt.outputs.format }}`
+
+            Built from upstream source: https://github.com/IrineSistiana/mosdns
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

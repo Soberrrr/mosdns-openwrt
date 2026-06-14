@@ -1,0 +1,7 @@
+sdk/
+artifacts/
+*.tar.zst
+*.tar.gz
+*.ipk
+*.apk
+.DS_Store

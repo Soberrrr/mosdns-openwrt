@@ -1,0 +1,27 @@
+log:
+  level: info
+  file: ""
+
+api:
+  http: "127.0.0.1:9091"
+
+plugins:
+  - tag: forward_remote
+    type: forward
+    args:
+      upstreams:
+        - addr: "https://1.1.1.1/dns-query"
+        - addr: "https://8.8.8.8/dns-query"
+
+  - tag: main_sequence
+    type: sequence
+    args:
+      - exec: $forward_remote
+
+servers:
+  - exec: main_sequence
+    listeners:
+      - protocol: udp
+        addr: ":5335"
+      - protocol: tcp
+        addr: ":5335"
